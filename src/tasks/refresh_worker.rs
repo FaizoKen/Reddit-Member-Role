@@ -126,7 +126,7 @@ pub async fn run(state: Arc<AppState>) {
         };
 
         // Refresh the access token
-        let reddit_oauth = RedditOAuth::with_client(state.oauth_http.clone());
+        let reddit_oauth = RedditOAuth::with_client(state.http.clone());
         let access_token = match reddit_oauth
             .refresh_access_token(&state.config, &refresh_token)
             .await

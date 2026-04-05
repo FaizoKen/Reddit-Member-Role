@@ -42,7 +42,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         (ok, start.elapsed().as_millis() as u64)
     };
     let svc_fut = check_service(
-        &state.oauth_http,
+        &state.http,
         "Reddit API",
         "https://www.reddit.com/api/v1/me",
     );

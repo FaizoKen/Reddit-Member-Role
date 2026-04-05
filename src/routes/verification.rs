@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar};
@@ -10,16 +9,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::AppError;
-use crate::services::discord_oauth::{self, DiscordOAuth};
 use crate::services::reddit_oauth::RedditOAuth;
+use crate::services::session;
 use crate::services::sync::PlayerSyncEvent;
 use crate::AppState;
 
-const SESSION_COOKIE: &str = "rmr_session";
+const SESSION_COOKIE: &str = "rl_session";
 
 fn get_session(jar: &CookieJar, secret: &str) -> Result<(String, String), AppError> {
     let cookie = jar.get(SESSION_COOKIE).ok_or(AppError::Unauthorized)?;
-    discord_oauth::verify_session(cookie.value(), secret).ok_or(AppError::Unauthorized)
+    session::verify_session(cookie.value(), secret).ok_or(AppError::Unauthorized)
 }
 
 pub fn render_verify_page(base_url: &str) -> String {
@@ -124,7 +123,7 @@ pub fn render_verify_page(base_url: &str) -> String {
     <noscript><p style="color:#f87171; margin-top:20px;">JavaScript is required.</p></noscript>
 
     <script>
-    const API = '';
+    const API = '{base_url}';
     const REDDIT_URL = '{base_url}/verify/reddit';
 
     async function api(method, path, body) {{
@@ -214,28 +213,11 @@ pub async fn verify_page(State(state): State<Arc<AppState>>) -> impl IntoRespons
 }
 
 pub async fn login(State(state): State<Arc<AppState>>) -> Response {
-    let state_param: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
-
-    let expires = chrono::Utc::now() + chrono::Duration::minutes(10);
-
-    if let Err(e) = sqlx::query(
-        "INSERT INTO oauth_states (state, redirect_data, expires_at) VALUES ($1, $2, $3)",
-    )
-    .bind(&state_param)
-    .bind(json!({"provider": "discord"}))
-    .bind(expires)
-    .execute(&state.pool)
-    .await
-    {
-        tracing::error!("Failed to store OAuth state: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
-    }
-
-    let url = DiscordOAuth::authorize_url(&state.config, &state_param);
+    let return_to = "/reddit-member-role/verify";
+    let url = format!(
+        "/auth/login?return_to={}",
+        urlencoding::encode(return_to),
+    );
     Redirect::temporary(&url).into_response()
 }
 
@@ -299,80 +281,11 @@ pub async fn callback(
         .await?;
 
     let redirect_data = state_row.0;
-    let provider = redirect_data["provider"].as_str().unwrap_or("");
+    let discord_id = redirect_data["discord_id"]
+        .as_str()
+        .ok_or(AppError::Internal("Missing discord_id in Reddit OAuth state".into()))?;
 
-    match provider {
-        "discord" => handle_discord_callback(&state, jar, &code).await,
-        "reddit" => {
-            let discord_id = redirect_data["discord_id"]
-                .as_str()
-                .ok_or(AppError::Internal("Missing discord_id in Reddit state".into()))?;
-            handle_reddit_callback(&state, jar, &code, discord_id).await
-        }
-        _ => Err(AppError::Internal("Unknown OAuth provider".into())),
-    }
-}
-
-async fn handle_discord_callback(
-    state: &Arc<AppState>,
-    jar: CookieJar,
-    code: &str,
-) -> Result<(CookieJar, Redirect), AppError> {
-    let oauth = DiscordOAuth::with_client(state.oauth_http.clone());
-    let (access_token, refresh_token) = oauth.exchange_code(&state.config, code).await?;
-    let (discord_id, display_name) = oauth.get_user(&access_token).await?;
-
-    // Store refresh token
-    if let Some(ref rt) = refresh_token {
-        let _ = sqlx::query(
-            "INSERT INTO discord_tokens (discord_id, refresh_token) VALUES ($1, $2) \
-             ON CONFLICT (discord_id) DO UPDATE SET refresh_token = $2",
-        )
-        .bind(&discord_id)
-        .bind(rt)
-        .execute(&state.pool)
-        .await;
-    }
-
-    // Fetch and store guild memberships
-    if let Ok(guilds) = oauth.get_user_guilds(&access_token).await {
-        if !guilds.is_empty() {
-            let guild_ids: Vec<&str> = guilds.iter().map(|(id, _)| id.as_str()).collect();
-            let guild_names: Vec<&str> = guilds.iter().map(|(_, name)| name.as_str()).collect();
-            let mut tx = state.pool.begin().await?;
-            let _ = sqlx::query("DELETE FROM user_guilds WHERE discord_id = $1")
-                .bind(&discord_id)
-                .execute(&mut *tx)
-                .await;
-            let _ = sqlx::query(
-                "INSERT INTO user_guilds (discord_id, guild_id, guild_name, updated_at) \
-                 SELECT $1, UNNEST($2::text[]), UNNEST($3::text[]), now()",
-            )
-            .bind(&discord_id)
-            .bind(&guild_ids)
-            .bind(&guild_names)
-            .execute(&mut *tx)
-            .await;
-            let _ = tx.commit().await;
-            let _ = sqlx::query(
-                "UPDATE discord_tokens SET guilds_refreshed_at = now() WHERE discord_id = $1",
-            )
-            .bind(&discord_id)
-            .execute(&state.pool)
-            .await;
-        }
-    }
-
-    // Create session cookie
-    let session_value =
-        discord_oauth::sign_session(&discord_id, &display_name, &state.config.session_secret);
-    let cookie = Cookie::build((SESSION_COOKIE, session_value))
-        .path("/")
-        .http_only(true)
-        .same_site(axum_extra::extract::cookie::SameSite::Lax)
-        .max_age(time::Duration::hours(1));
-
-    Ok((jar.add(cookie), Redirect::to(&format!("{}/verify", state.config.base_url))))
+    handle_reddit_callback(&state, jar, &code, discord_id).await
 }
 
 async fn handle_reddit_callback(
@@ -381,7 +294,7 @@ async fn handle_reddit_callback(
     code: &str,
     discord_id: &str,
 ) -> Result<(CookieJar, Redirect), AppError> {
-    let reddit_oauth = RedditOAuth::with_client(state.oauth_http.clone());
+    let reddit_oauth = RedditOAuth::with_client(state.http.clone());
     let (access_token, refresh_token) = reddit_oauth.exchange_code(&state.config, code).await?;
 
     // Fetch Reddit user info
